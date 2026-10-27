@@ -1,0 +1,750 @@
+"""Pro Screen Recorder - Siêu Nhẹ & Đỉnh Cao Cho Windows.
+Quay màn hình phần cứng GPU, thu âm mic, hiệu ứng chuột, đếm ngược, lưu tức thì.
+"""
+import os
+import subprocess
+import sys
+import threading
+import tkinter as tk
+from tkinter import messagebox
+from pathlib import Path
+import customtkinter as ctk
+
+from settings import Settings
+from recorder_engine import RecorderEngine
+from region_selector import RegionSelector
+from floating_bar import FloatingBar
+from library_window import LibraryWindow
+from hotkey_manager import HotkeyManager
+from countdown_overlay import CountdownOverlay
+from desktop_support import SingleInstance, set_high_dpi_aware, exclude_from_capture
+
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+
+class ProScreenRecorderApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("Pro Screen Recorder - Ghi Màn Hình & Micro")
+        self.geometry("580x800")
+        self.minsize(540, 720)
+        self.configure(fg_color="#0b0f19")
+
+        # Set window icon
+        icon_path = Path(__file__).parent / "assets" / "icon.ico"
+        if icon_path.is_file():
+            try:
+                self.iconbitmap(str(icon_path))
+            except Exception:
+                pass
+
+        self.settings = Settings()
+        exclude_from_capture(self)
+        self.engine = RecorderEngine(self.settings, on_update_callback=self._on_engine_update)
+        self.floating_bar = None
+        self.library_win = None
+        self.last_saved_file = None
+
+        # Hotkeys
+        self.hotkeys = HotkeyManager(
+            on_toggle_record=self._on_hotkey_toggle_record,
+            on_toggle_pause=self._on_hotkey_toggle_pause
+        )
+        self.hotkeys.start()
+
+        # Build UI in a scrollable frame so all pro settings fit cleanly
+        self.main_scroll = ctk.CTkScrollableFrame(self, fg_color="#0b0f19")
+        self.main_scroll.pack(fill="both", expand=True)
+
+        self._build_header()
+        self._build_record_card()
+        self._build_toast_card()
+        self._build_audio_card()
+        self._build_capture_settings_card()
+        self._build_footer()
+
+        # Handle window close
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _build_header(self):
+        header = ctk.CTkFrame(self.main_scroll, fg_color="#111827", height=55, corner_radius=10)
+        header.pack(fill="x", side="top", padx=16, pady=(10, 6))
+
+        left = ctk.CTkFrame(header, fg_color="transparent")
+        left.pack(side="left", padx=16, pady=10)
+
+        ctk.CTkLabel(
+            left, text="🎥 PRO SCREEN RECORDER",
+            font=("Segoe UI", 16, "bold"), text_color="#f8fafc"
+        ).pack(side="left")
+
+        ctk.CTkLabel(
+            left, text="Pro Edition • Siêu Nhẹ & GPU",
+            font=("Segoe UI", 11), text_color="#38bdf8"
+        ).pack(side="left", padx=(10, 0))
+
+        btn_lib = ctk.CTkButton(
+            header, text="📹 Thư Viện", width=105, height=32,
+            fg_color="#1e293b", hover_color="#334155",
+            corner_radius=8, font=("Segoe UI", 12, "bold"),
+            command=self.open_library
+        )
+        btn_lib.pack(side="right", padx=14, pady=10)
+
+    def _build_record_card(self):
+        self.record_card = ctk.CTkFrame(self.main_scroll, fg_color="#161e2e", corner_radius=14, border_width=1, border_color="#1f2937")
+        self.record_card.pack(fill="x", padx=16, pady=6)
+
+        # Main Record Button
+        self.btn_record = ctk.CTkButton(
+            self.record_card, text="🔴  BẮT ĐẦU GHI HÌNH (F9)",
+            height=54, corner_radius=10,
+            fg_color="#dc2626", hover_color="#b91c1c",
+            font=("Segoe UI", 16, "bold"),
+            command=self.toggle_recording
+        )
+        self.btn_record.pack(fill="x", padx=16, pady=(16, 8))
+
+        # Secondary Control (Pause / Resume)
+        sub_row = ctk.CTkFrame(self.record_card, fg_color="transparent")
+        sub_row.pack(fill="x", padx=16, pady=(0, 10))
+
+        self.btn_pause = ctk.CTkButton(
+            sub_row, text="⏸ Tạm Dừng (F10)", height=34,
+            fg_color="#374151", hover_color="#4b5563",
+            corner_radius=8, font=("Segoe UI", 13),
+            state="disabled",
+            command=self.toggle_pause
+        )
+        self.btn_pause.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        self.btn_open_rec_folder = ctk.CTkButton(
+            sub_row, text="📁 Thư mục lưu", height=34, width=120,
+            fg_color="#374151", hover_color="#4b5563",
+            corner_radius=8, font=("Segoe UI", 13),
+            command=self._open_output_dir
+        )
+        self.btn_open_rec_folder.pack(side="right", padx=(4, 0))
+
+        # Live Stats Display
+        self.stats_box = ctk.CTkFrame(self.record_card, fg_color="#0f172a", corner_radius=10)
+        self.stats_box.pack(fill="x", padx=16, pady=(4, 14))
+
+        stats_row = ctk.CTkFrame(self.stats_box, fg_color="transparent")
+        stats_row.pack(fill="x", padx=14, pady=8)
+
+        self.lbl_status = ctk.CTkLabel(
+            stats_row, text="● SẴN SÀNG", font=("Segoe UI", 12, "bold"),
+            text_color="#10b981"
+        )
+        self.lbl_status.pack(side="left")
+
+        self.lbl_timer = ctk.CTkLabel(
+            stats_row, text="00:00:00", font=("Consolas", 18, "bold"),
+            text_color="#f8fafc"
+        )
+        self.lbl_timer.pack(side="left", expand=True)
+
+        self.lbl_details = ctk.CTkLabel(
+            stats_row, text="30 FPS  •  0 MB", font=("Segoe UI", 12),
+            text_color="#94a3b8"
+        )
+        self.lbl_details.pack(side="right")
+
+    def _build_toast_card(self):
+        """Instant non-blocking notification banner shown when video finishes saving."""
+        self.toast_card = ctk.CTkFrame(
+            self.main_scroll, fg_color="#064e3b",
+            corner_radius=12, border_width=1, border_color="#059669"
+        )
+        # Not packed initially
+
+        inner = ctk.CTkFrame(self.toast_card, fg_color="transparent")
+        inner.pack(fill="x", padx=14, pady=10)
+
+        left_info = ctk.CTkFrame(inner, fg_color="transparent")
+        left_info.pack(side="left", fill="both", expand=True)
+
+        self.lbl_toast_title = ctk.CTkLabel(
+            left_info, text="✅ ĐÃ LƯU VIDEO THÀNH CÔNG!",
+            font=("Segoe UI", 13, "bold"), text_color="#6ee7b7", anchor="w"
+        )
+        self.lbl_toast_title.pack(fill="x")
+
+        self.lbl_toast_subtitle = ctk.CTkLabel(
+            left_info, text="REC_...mp4",
+            font=("Segoe UI", 11), text_color="#d1fae5", anchor="w"
+        )
+        self.lbl_toast_subtitle.pack(fill="x")
+
+        btn_box = ctk.CTkFrame(inner, fg_color="transparent")
+        btn_box.pack(side="right")
+
+        btn_play = ctk.CTkButton(
+            btn_box, text="▶ Xem ngay", width=84, height=30,
+            fg_color="#10b981", hover_color="#059669",
+            corner_radius=6, font=("Segoe UI", 11, "bold"),
+            command=self._play_last_video
+        )
+        btn_play.pack(side="left", padx=4)
+
+        btn_loc = ctk.CTkButton(
+            btn_box, text="📂 Vị trí", width=70, height=30,
+            fg_color="#047857", hover_color="#065f46",
+            corner_radius=6, font=("Segoe UI", 11),
+            command=self._locate_last_video
+        )
+        btn_loc.pack(side="left", padx=4)
+
+        btn_close = ctk.CTkButton(
+            btn_box, text="✕", width=28, height=30,
+            fg_color="#064e3b", hover_color="#065f46",
+            corner_radius=6, font=("Segoe UI", 12),
+            command=self._hide_toast
+        )
+        btn_close.pack(side="left", padx=(2, 0))
+
+    def _play_last_video(self):
+        if self.last_saved_file and Path(self.last_saved_file).is_file():
+            try:
+                os.startfile(str(self.last_saved_file))
+            except Exception:
+                pass
+
+    def _locate_last_video(self):
+        if self.last_saved_file and Path(self.last_saved_file).is_file():
+            try:
+                subprocess.run(["explorer", f"/select,{self.last_saved_file}"])
+            except Exception:
+                try:
+                    os.startfile(str(Path(self.last_saved_file).parent))
+                except Exception:
+                    pass
+
+    def _hide_toast(self):
+        self.toast_card.pack_forget()
+
+    def _build_audio_card(self):
+        card = ctk.CTkFrame(self.main_scroll, fg_color="#161e2e", corner_radius=14, border_width=1, border_color="#1f2937")
+        card.pack(fill="x", padx=16, pady=6)
+
+        # Title + Toggle
+        top_row = ctk.CTkFrame(card, fg_color="transparent")
+        top_row.pack(fill="x", padx=16, pady=(12, 6))
+
+        ctk.CTkLabel(
+            top_row, text="🎙️ THU ÂM MICROPHONE",
+            font=("Segoe UI", 13, "bold"), text_color="#f8fafc"
+        ).pack(side="left")
+
+        self.switch_mic = ctk.CTkSwitch(
+            top_row, text="Bật Micro",
+            command=self._on_mic_switch_changed
+        )
+        if self.settings.record_mic:
+            self.switch_mic.select()
+        else:
+            self.switch_mic.deselect()
+        self.switch_mic.pack(side="right")
+
+        # Device selector
+        mid_row = ctk.CTkFrame(card, fg_color="transparent")
+        mid_row.pack(fill="x", padx=16, pady=4)
+
+        ctk.CTkLabel(mid_row, text="Thiết bị:", font=("Segoe UI", 12), text_color="#94a3b8").pack(side="left", padx=(0, 8))
+
+        mics = self.engine.audio_mgr.list_microphones()
+        self.mic_map = {m["name"]: m["index"] for m in mics}
+        mic_options = list(self.mic_map.keys()) if self.mic_map else ["Microphone mặc định hệ thống"]
+
+        self.combo_mic = ctk.CTkComboBox(
+            mid_row, values=mic_options,
+            command=self._on_mic_device_changed,
+            height=30, corner_radius=8
+        )
+        self.combo_mic.pack(side="left", fill="x", expand=True)
+        if mic_options:
+            self.combo_mic.set(mic_options[0])
+
+        # Volume Boost Slider (100% -> 200%)
+        vol_row = ctk.CTkFrame(card, fg_color="transparent")
+        vol_row.pack(fill="x", padx=16, pady=(6, 2))
+
+        ctk.CTkLabel(vol_row, text="Khuếch đại mic:", font=("Segoe UI", 12), text_color="#94a3b8").pack(side="left", padx=(0, 8))
+        self.lbl_vol_val = ctk.CTkLabel(
+            vol_row, text=f"{int(self.settings.mic_volume * 100)}%",
+            font=("Segoe UI", 11, "bold"), text_color="#38bdf8", width=42
+        )
+        self.lbl_vol_val.pack(side="right")
+
+        self.slider_mic_vol = ctk.CTkSlider(
+            vol_row, from_=0.5, to=2.0, number_of_steps=15,
+            command=self._on_mic_volume_changed
+        )
+        self.slider_mic_vol.set(self.settings.mic_volume)
+        self.slider_mic_vol.pack(side="left", fill="x", expand=True)
+
+        # Live VU Meter Bar
+        vu_row = ctk.CTkFrame(card, fg_color="transparent")
+        vu_row.pack(fill="x", padx=16, pady=(6, 12))
+
+        ctk.CTkLabel(vu_row, text="Mức âm:", font=("Segoe UI", 11), text_color="#64748b").pack(side="left", padx=(0, 8))
+
+        self.mic_vu_canvas = tk.Canvas(vu_row, height=12, bg="#0f172a", highlightthickness=0)
+        self.mic_vu_canvas.pack(side="left", fill="x", expand=True)
+        self.mic_vu_bar = self.mic_vu_canvas.create_rectangle(0, 0, 0, 12, fill="#10b981", width=0)
+
+    def _build_capture_settings_card(self):
+        card = ctk.CTkFrame(self.main_scroll, fg_color="#161e2e", corner_radius=14, border_width=1, border_color="#1f2937")
+        card.pack(fill="x", padx=16, pady=6)
+
+        ctk.CTkLabel(
+            card, text="⚙️ THIẾT LẬP GHI HÌNH CHUYÊN NGHIỆP",
+            font=("Segoe UI", 13, "bold"), text_color="#f8fafc"
+        ).pack(anchor="w", padx=16, pady=(12, 6))
+
+        # Row 1: Mode Area Selection
+        row1 = ctk.CTkFrame(card, fg_color="transparent")
+        row1.pack(fill="x", padx=16, pady=4)
+
+        ctk.CTkLabel(row1, text="Phạm vi:", font=("Segoe UI", 12), text_color="#94a3b8").pack(side="left", padx=(0, 8))
+
+        self.seg_area = ctk.CTkSegmentedButton(
+            row1, values=["Toàn màn hình", "Chọn vùng quay"],
+            command=self._on_area_mode_changed
+        )
+        self.seg_area.set("Toàn màn hình")
+        self.seg_area.pack(side="left", padx=(0, 8))
+
+        self.btn_select_region = ctk.CTkButton(
+            row1, text="📐 Chọn vùng...", width=100, height=28,
+            fg_color="#0284c7", hover_color="#0369a1",
+            corner_radius=6, font=("Segoe UI", 11),
+            state="disabled",
+            command=self._launch_region_selector
+        )
+        self.btn_select_region.pack(side="left")
+
+        # Row 2: Resolution & Countdown
+        row2 = ctk.CTkFrame(card, fg_color="transparent")
+        row2.pack(fill="x", padx=16, pady=4)
+
+        ctk.CTkLabel(row2, text="Độ phân giải:", font=("Segoe UI", 12), text_color="#94a3b8").pack(side="left", padx=(0, 8))
+        self.combo_res = ctk.CTkComboBox(
+            row2, values=["Native (Gốc)", "1080p Full HD", "720p HD"],
+            width=130, height=28,
+            command=self._on_res_changed
+        )
+        res_map = {"Native": "Native (Gốc)", "1080p": "1080p Full HD", "720p": "720p HD"}
+        self.combo_res.set(res_map.get(self.settings.resolution_preset, "Native (Gốc)"))
+        self.combo_res.pack(side="left", padx=(0, 16))
+
+        ctk.CTkLabel(row2, text="Đếm ngược:", font=("Segoe UI", 12), text_color="#94a3b8").pack(side="left", padx=(0, 8))
+        self.combo_cd = ctk.CTkComboBox(
+            row2, values=["3 giây", "5 giây", "Tắt đếm ngược"],
+            width=120, height=28,
+            command=self._on_cd_changed
+        )
+        cd_map = {3: "3 giây", 5: "5 giây", 0: "Tắt đếm ngược"}
+        self.combo_cd.set(cd_map.get(self.settings.countdown_seconds, "3 giây"))
+        self.combo_cd.pack(side="left")
+
+        # Row 3: FPS & Quality
+        row3 = ctk.CTkFrame(card, fg_color="transparent")
+        row3.pack(fill="x", padx=16, pady=4)
+
+        ctk.CTkLabel(row3, text="Khung hình:", font=("Segoe UI", 12), text_color="#94a3b8").pack(side="left", padx=(0, 8))
+        self.combo_fps = ctk.CTkComboBox(
+            row3, values=["30 FPS (Nhẹ nhất)", "60 FPS (Mượt mà)"],
+            width=140, height=28,
+            command=self._on_fps_changed
+        )
+        self.combo_fps.set(f"{self.settings.fps} FPS ({'Nhẹ nhất' if self.settings.fps == 30 else 'Mượt mà'})")
+        self.combo_fps.pack(side="left", padx=(0, 16))
+
+        ctk.CTkLabel(row3, text="Chất lượng:", font=("Segoe UI", 12), text_color="#94a3b8").pack(side="left", padx=(0, 8))
+        self.combo_quality = ctk.CTkComboBox(
+            row3, values=["Standard", "High", "Ultra"],
+            width=100, height=28,
+            command=self._on_quality_changed
+        )
+        self.combo_quality.set(self.settings.quality)
+        self.combo_quality.pack(side="left")
+
+        # Row 4: Mouse Effects (Highlight Halo & Click Ripples)
+        row4 = ctk.CTkFrame(card, fg_color="transparent")
+        row4.pack(fill="x", padx=16, pady=6)
+
+        self.chk_cursor = ctk.CTkCheckBox(
+            row4, text="Hiện con trỏ chuột",
+            command=self._on_cursor_toggled
+        )
+        if self.settings.record_cursor:
+            self.chk_cursor.select()
+        else:
+            self.chk_cursor.deselect()
+        self.chk_cursor.pack(side="left", padx=(0, 14))
+
+        self.chk_halo = ctk.CTkCheckBox(
+            row4, text="Vòng sáng nổi bật chuột (Halo)",
+            command=self._on_halo_toggled
+        )
+        if getattr(self.settings, "mouse_halo", True):
+            self.chk_halo.select()
+        else:
+            self.chk_halo.deselect()
+        self.chk_halo.pack(side="left", padx=(0, 14))
+
+        self.chk_ripple = ctk.CTkCheckBox(
+            row4, text="Hiệu ứng nhấp chuột (Click)",
+            command=self._on_ripple_toggled
+        )
+        if getattr(self.settings, "mouse_click_ripple", True):
+            self.chk_ripple.select()
+        else:
+            self.chk_ripple.deselect()
+        self.chk_ripple.pack(side="left")
+
+        # Row 5: Floating Bar Option
+        row5 = ctk.CTkFrame(card, fg_color="transparent")
+        row5.pack(fill="x", padx=16, pady=(4, 6))
+
+        self.chk_float = ctk.CTkCheckBox(
+            row5, text="Thanh điều khiển nổi (Tàng hình trong video)",
+            command=self._on_float_toggled
+        )
+        if self.settings.show_floating_bar:
+            self.chk_float.select()
+        else:
+            self.chk_float.deselect()
+        self.chk_float.pack(side="left")
+
+        # Hint note
+        hint_lbl = ctk.CTkLabel(
+            card,
+            text="✨ Thanh nổi hiện trên màn hình để điều khiển nhưng hoàn toàn tàng hình trong video clip.\n    (Bỏ chọn nếu muốn ẩn hoàn toàn không hiện gì, chỉ dùng phím F9/F10).",
+            font=("Segoe UI", 11), text_color="#0284c7", justify="left"
+        )
+        hint_lbl.pack(anchor="w", padx=18, pady=(0, 12))
+
+    def _build_footer(self):
+        footer = ctk.CTkFrame(self.main_scroll, fg_color="transparent")
+        footer.pack(fill="x", side="bottom", padx=16, pady=12)
+
+        ctk.CTkLabel(
+            footer,
+            text="⌨️ Phím tắt: F9 (Bắt đầu/Dừng)  •  F10 (Tạm dừng/Tiếp tục)",
+            font=("Segoe UI", 11), text_color="#64748b"
+        ).pack(side="left")
+
+        btn_quit = ctk.CTkButton(
+            footer, text="Thoát", width=70, height=28,
+            fg_color="#334155", hover_color="#475569",
+            corner_radius=6, font=("Segoe UI", 11),
+            command=self.on_close
+        )
+        btn_quit.pack(side="right")
+
+    # --- Event Handlers & State Management ---
+
+    def _on_mic_switch_changed(self):
+        enabled = bool(self.switch_mic.get())
+        self.settings.record_mic = enabled
+        self.settings.save()
+
+    def _on_mic_device_changed(self, choice):
+        idx = self.mic_map.get(choice)
+        self.settings.mic_device_index = idx
+        self.settings.save()
+
+    def _on_mic_volume_changed(self, value):
+        self.settings.mic_volume = round(float(value), 2)
+        self.lbl_vol_val.configure(text=f"{int(self.settings.mic_volume * 100)}%")
+        self.settings.save()
+
+    def _on_area_mode_changed(self, choice):
+        if choice == "Chọn vùng quay":
+            self.btn_select_region.configure(state="normal")
+            self._launch_region_selector()
+        else:
+            self.btn_select_region.configure(state="disabled")
+            self.engine.set_region(None)
+
+    def _launch_region_selector(self):
+        self.withdraw()
+
+        def on_region_picked(region):
+            self.deiconify()
+            if region:
+                self.engine.set_region(region)
+                self.btn_select_region.configure(text=f"📐 {region[2]}x{region[3]}")
+            else:
+                self.seg_area.set("Toàn màn hình")
+                self.btn_select_region.configure(state="disabled", text="📐 Chọn vùng...")
+                self.engine.set_region(None)
+
+        selector = RegionSelector(on_region_picked)
+        selector.start()
+
+    def _on_res_changed(self, choice):
+        preset = "Native"
+        if "720p" in choice:
+            preset = "720p"
+        elif "1080p" in choice:
+            preset = "1080p"
+        self.settings.resolution_preset = preset
+        self.settings.save()
+
+    def _on_cd_changed(self, choice):
+        cd = 3
+        if "5" in choice:
+            cd = 5
+        elif "Tắt" in choice:
+            cd = 0
+        self.settings.countdown_seconds = cd
+        self.settings.save()
+
+    def _on_fps_changed(self, choice):
+        fps = 60 if "60" in choice else 30
+        self.settings.fps = fps
+        self.settings.save()
+
+    def _on_quality_changed(self, choice):
+        self.settings.quality = choice
+        self.settings.save()
+
+    def _on_cursor_toggled(self):
+        self.settings.record_cursor = bool(self.chk_cursor.get())
+        self.settings.save()
+
+    def _on_halo_toggled(self):
+        self.settings.mouse_halo = bool(self.chk_halo.get())
+        self.settings.save()
+
+    def _on_ripple_toggled(self):
+        self.settings.mouse_click_ripple = bool(self.chk_ripple.get())
+        self.settings.save()
+
+    def _on_float_toggled(self):
+        self.settings.show_floating_bar = bool(self.chk_float.get())
+        self.settings.save()
+
+    def _open_output_dir(self):
+        try:
+            os.startfile(self.settings.output_dir)
+        except Exception:
+            pass
+
+    def open_library(self):
+        if self.library_win and self.library_win.winfo_exists():
+            self.library_win.lift()
+            self.library_win.focus_force()
+            return
+        self.library_win = LibraryWindow(self, self.settings.output_dir)
+
+    # --- Recording Control ---
+
+    def toggle_recording(self):
+        if self.engine.state == "idle":
+            self.start_recording()
+        elif self.engine.state in ("recording", "paused"):
+            self.stop_recording()
+
+    def start_recording(self):
+        self._hide_toast()
+        cd = getattr(self.settings, "countdown_seconds", 3)
+        if cd > 0:
+            self.withdraw()
+            overlay = CountdownOverlay(
+                seconds=cd,
+                on_finish=self._actual_start_recording,
+                on_cancel=self._on_countdown_cancelled
+            )
+            overlay.start()
+        else:
+            self._actual_start_recording()
+
+    def _on_countdown_cancelled(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _actual_start_recording(self):
+        try:
+            success = self.engine.start()
+            if not success:
+                self.deiconify()
+                return
+        except Exception as e:
+            self.deiconify()
+            messagebox.showerror("Lỗi Ghi Hình", str(e), parent=self)
+            return
+
+        # UI state
+        self.btn_record.configure(text="⏹  DỪNG GHI HÌNH (F9)", fg_color="#ef4444", hover_color="#dc2626")
+        self.btn_pause.configure(state="normal", text="⏸ Tạm Dừng (F10)")
+        self.lbl_status.configure(text="● ĐANG QUAY", text_color="#ef4444")
+
+        # Show floating bar if enabled
+        if self.settings.show_floating_bar:
+            if not self.floating_bar or not self.floating_bar.winfo_exists():
+                self.floating_bar = FloatingBar(
+                    self,
+                    on_pause=self.pause_recording,
+                    on_resume=self.resume_recording,
+                    on_stop=self.stop_recording,
+                    on_restore=self._restore_from_floating
+                )
+            self.engine.set_excluded_rect_provider(self.floating_bar.get_screen_rect)
+        else:
+            self.engine.set_excluded_rect_provider(None)
+
+        if self.settings.minimize_on_start:
+            self.withdraw()
+
+    def toggle_pause(self):
+        if self.engine.state == "recording":
+            self.pause_recording()
+        elif self.engine.state == "paused":
+            self.resume_recording()
+
+    def pause_recording(self):
+        if self.engine.pause():
+            self.btn_pause.configure(text="▶ Tiếp Tục (F10)", fg_color="#0284c7", hover_color="#0369a1")
+            self.lbl_status.configure(text="❚❚ TẠM DỪNG", text_color="#eab308")
+            if self.floating_bar and self.floating_bar.winfo_exists():
+                self.floating_bar.is_paused = True
+                self.floating_bar.btn_pause.configure(text="▶", fg_color="#0284c7")
+
+    def resume_recording(self):
+        if self.engine.resume():
+            self.btn_pause.configure(text="⏸ Tạm Dừng (F10)", fg_color="#374151", hover_color="#4b5563")
+            self.lbl_status.configure(text="● ĐANG QUAY", text_color="#ef4444")
+            if self.floating_bar and self.floating_bar.winfo_exists():
+                self.floating_bar.is_paused = False
+                self.floating_bar.btn_pause.configure(text="⏸", fg_color="#334155")
+
+    def stop_recording(self):
+        self.engine.set_excluded_rect_provider(None)
+        self.lbl_status.configure(text="⏳ ĐANG XỬ LÝ & LƯU...", text_color="#38bdf8")
+        self.btn_record.configure(state="disabled", text="⏳ Đang đóng gói file...")
+        self.btn_pause.configure(state="disabled")
+
+        if self.floating_bar and self.floating_bar.winfo_exists():
+            self.floating_bar.destroy()
+            self.floating_bar = None
+
+        def _do_stop():
+            final_file = self.engine.stop()
+            self.after(0, lambda: self._on_stop_complete(final_file))
+
+        threading.Thread(target=_do_stop, daemon=True).start()
+
+    def _on_stop_complete(self, final_file):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+        self.btn_record.configure(state="normal", text="🔴  BẮT ĐẦU GHI HÌNH (F9)", fg_color="#dc2626", hover_color="#b91c1c")
+        self.btn_pause.configure(state="disabled", text="⏸ Tạm Dừng (F10)", fg_color="#374151")
+        self.lbl_status.configure(text="● SẴN SÀNG", text_color="#10b981")
+        self.lbl_timer.configure(text="00:00:00")
+        self.lbl_details.configure(text="30 FPS  •  0 MB")
+
+        # Reset VU meter
+        self.mic_vu_canvas.coords(self.mic_vu_bar, 0, 0, 0, 12)
+
+        if final_file and Path(final_file).is_file():
+            self.last_saved_file = Path(final_file)
+            size_mb = self.last_saved_file.stat().st_size / (1024 * 1024)
+            self.lbl_toast_subtitle.configure(text=f"📁 {self.last_saved_file.name}   •   {size_mb:.1f} MB")
+            # Show instant toast banner right below record card
+            self.toast_card.pack(fill="x", padx=16, pady=4, after=self.record_card)
+
+            # Refresh library if open
+            if self.library_win and self.library_win.winfo_exists():
+                self.library_win.refresh_list()
+
+    def _restore_from_floating(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _on_engine_update(self, stats):
+        def _apply():
+            if not self.winfo_exists():
+                return
+            elapsed = stats.get("elapsed", 0.0)
+            m, s = divmod(int(elapsed), 60)
+            h, m = divmod(m, 60)
+            self.lbl_timer.configure(text=f"{h:02d}:{m:02d}:{s:02d}")
+
+            fps = stats.get("fps", 0.0)
+            size_mb = stats.get("size_bytes", 0) / (1024 * 1024)
+            self.lbl_details.configure(text=f"{fps:.1f} FPS  •  {size_mb:.1f} MB")
+
+            # Mic VU meter
+            mic_rms = stats.get("mic_rms", 0.0)
+            canvas_w = self.mic_vu_canvas.winfo_width()
+            if canvas_w > 10:
+                bar_w = int(max(0.0, min(1.0, mic_rms)) * canvas_w)
+                color = "#10b981" if mic_rms < 0.8 else "#ef4444"
+                self.mic_vu_canvas.coords(self.mic_vu_bar, 0, 0, bar_w, 12)
+                self.mic_vu_canvas.itemconfig(self.mic_vu_bar, fill=color)
+
+            # Update floating bar if exists
+            if self.floating_bar and self.floating_bar.winfo_exists():
+                self.floating_bar.update_stats(elapsed, mic_rms)
+
+        self.after(0, _apply)
+
+    # --- Hotkeys Handlers ---
+
+    def _on_hotkey_toggle_record(self):
+        self.after(0, self.toggle_recording)
+
+    def _on_hotkey_toggle_pause(self):
+        self.after(0, self.toggle_pause)
+
+    # --- Teardown ---
+
+    def on_close(self):
+        if self.engine.state in ("recording", "paused"):
+            confirm = messagebox.askyesno(
+                "Đang ghi hình",
+                "Quá trình ghi hình đang diễn ra. Bạn có muốn dừng và lưu lại video trước khi đóng không?",
+                parent=self
+            )
+            if confirm:
+                self.stop_recording()
+                return
+
+        # Close all windows and hooks
+        self.hotkeys.stop()
+        if self.floating_bar and self.floating_bar.winfo_exists():
+            self.floating_bar.destroy()
+        if self.library_win and self.library_win.winfo_exists():
+            self.library_win.destroy()
+        self.engine.audio_mgr.close()
+        self.destroy()
+
+
+def main():
+    set_high_dpi_aware()
+    instance = SingleInstance("Local\\ProScreenRecorder.Instance")
+    if instance.already_running:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo("Thông báo", "Pro Screen Recorder đang chạy trên máy tính.")
+        root.destroy()
+        sys.exit(0)
+
+    app = ProScreenRecorderApp()
+    app.mainloop()
+    instance.close()
+
+
+if __name__ == "__main__":
+    main()

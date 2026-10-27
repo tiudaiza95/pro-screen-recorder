@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+build/
+dist/
+*.spec.bak
+
+# Exclude recorded videos from Git repo
+recordings/*.mp4
+recordings/*.wav
+recordings/~*
+!recordings/.gitkeep

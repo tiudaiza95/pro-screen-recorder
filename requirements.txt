@@ -1,0 +1,6 @@
+customtkinter>=5.2.0
+PyAudioWPatch>=0.2.12.9
+pystray>=0.19.5
+Pillow>=10.0.0
+numpy>=1.24.0
+darkdetect>=0.8.0
