@@ -27,6 +27,8 @@ class Settings:
         self.hotkey_pause_resume = "F10"
         self.minimize_on_start = True
         self.show_floating_bar = True
+        self.sound_cues = True           # Subtle audio cues on record/stop/tray
+        self.close_to_tray = True        # Closing [X] minimizes to tray
         self.load()
 
     def get_bitrate(self):
@@ -76,6 +78,8 @@ class Settings:
                 "hotkey_pause_resume": self.hotkey_pause_resume,
                 "minimize_on_start": self.minimize_on_start,
                 "show_floating_bar": self.show_floating_bar,
+                "sound_cues": self.sound_cues,
+                "close_to_tray": self.close_to_tray,
             }
             CONFIG_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception:

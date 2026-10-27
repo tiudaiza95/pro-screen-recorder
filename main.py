@@ -1,5 +1,5 @@
 """Pro Screen Recorder - Siêu Nhẹ & Đỉnh Cao Cho Windows.
-Quay màn hình phần cứng GPU, thu âm mic, hiệu ứng chuột, đếm ngược, lưu tức thì.
+Quay màn hình phần cứng GPU, khay hệ thống, hiệu ứng chuyển động, âm thanh thông báo.
 """
 import os
 import subprocess
@@ -17,7 +17,10 @@ from floating_bar import FloatingBar
 from library_window import LibraryWindow
 from hotkey_manager import HotkeyManager
 from countdown_overlay import CountdownOverlay
-from desktop_support import SingleInstance, set_high_dpi_aware, exclude_from_capture
+from desktop_support import (
+    SingleInstance, set_high_dpi_aware, exclude_from_capture,
+    set_dark_titlebar, play_sound_cue, create_tray
+)
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
@@ -28,17 +31,21 @@ class ProScreenRecorderApp(ctk.CTk):
         super().__init__()
 
         self.title("Pro Screen Recorder - Ghi Màn Hình & Micro")
-        self.geometry("580x800")
+        self.geometry("600x820")
         self.minsize(540, 720)
         self.configure(fg_color="#0b0f19")
 
-        # Set window icon
-        icon_path = Path(__file__).parent / "assets" / "icon.ico"
-        if icon_path.is_file():
+        # Start hidden for smooth fade-in animation
+        self.attributes("-alpha", 0.0)
+
+        # Set window icon & native Windows dark titlebar
+        self.icon_path = Path(__file__).parent / "assets" / "icon.ico"
+        if self.icon_path.is_file():
             try:
-                self.iconbitmap(str(icon_path))
+                self.iconbitmap(str(self.icon_path))
             except Exception:
                 pass
+        set_dark_titlebar(self)
 
         self.settings = Settings()
         exclude_from_capture(self)
@@ -46,15 +53,19 @@ class ProScreenRecorderApp(ctk.CTk):
         self.floating_bar = None
         self.library_win = None
         self.last_saved_file = None
+        self.tray = None
 
-        # Hotkeys
+        # Pulsing recording glow animation state
+        self._pulse_glow = False
+
+        # Global Hotkeys
         self.hotkeys = HotkeyManager(
             on_toggle_record=self._on_hotkey_toggle_record,
             on_toggle_pause=self._on_hotkey_toggle_pause
         )
         self.hotkeys.start()
 
-        # Build UI in a scrollable frame so all pro settings fit cleanly
+        # Build UI in a scrollable frame
         self.main_scroll = ctk.CTkScrollableFrame(self, fg_color="#0b0f19")
         self.main_scroll.pack(fill="both", expand=True)
 
@@ -65,8 +76,111 @@ class ProScreenRecorderApp(ctk.CTk):
         self._build_capture_settings_card()
         self._build_footer()
 
-        # Handle window close
+        # Initialize System Tray in background thread
+        self._init_tray()
+
+        # Handle window close [X]
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # Smooth opening fade-in animation
+        self.after(50, self.fade_in)
+
+    # --- Window Animations (Fade-in / Fade-out) ---
+
+    def fade_in(self, target_alpha=1.0, step=0.1, interval=12):
+        """Smoothly fades in the window on launch or restore."""
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+        def _step(current):
+            next_val = min(target_alpha, current + step)
+            try:
+                self.attributes("-alpha", next_val)
+                if next_val < target_alpha:
+                    self.after(interval, lambda: _step(next_val))
+            except Exception:
+                pass
+
+        _step(0.0)
+
+    def fade_out_to_tray(self, step=0.12, interval=10):
+        """Smoothly fades out the window before hiding into the system tray."""
+        if getattr(self.settings, "sound_cues", True):
+            play_sound_cue("tray")
+
+        def _step(current):
+            next_val = max(0.0, current - step)
+            try:
+                self.attributes("-alpha", next_val)
+                if next_val > 0.0:
+                    self.after(interval, lambda: _step(next_val))
+                else:
+                    self.withdraw()
+                    self.attributes("-alpha", 1.0)
+            except Exception:
+                self.withdraw()
+                self.attributes("-alpha", 1.0)
+
+        cur_alpha = float(self.attributes("-alpha") or 1.0)
+        _step(cur_alpha)
+
+    # --- System Tray Integration ---
+
+    def _init_tray(self):
+        def _run_tray():
+            try:
+                self.tray = create_tray(
+                    icon_path=self.icon_path,
+                    on_open=self._on_tray_open,
+                    on_toggle_record=self._on_tray_toggle_record,
+                    on_toggle_pause=self._on_tray_toggle_pause,
+                    on_open_library=self._on_tray_open_library,
+                    on_open_desktop=self._on_tray_open_desktop,
+                    on_quit=self._on_tray_quit
+                )
+                self.tray.run()
+            except Exception:
+                pass
+
+        threading.Thread(target=_run_tray, daemon=True).start()
+
+    def _on_tray_open(self, icon=None, item=None):
+        self.after(0, self.show_from_tray)
+
+    def _on_tray_toggle_record(self, icon=None, item=None):
+        self.after(0, self.toggle_recording)
+
+    def _on_tray_toggle_pause(self, icon=None, item=None):
+        self.after(0, self.toggle_pause)
+
+    def _on_tray_open_library(self, icon=None, item=None):
+        self.after(0, self.open_library)
+
+    def _on_tray_open_desktop(self, icon=None, item=None):
+        self.after(0, self._open_output_dir)
+
+    def _on_tray_quit(self, icon=None, item=None):
+        self.after(0, self.quit_app)
+
+    def hide_to_tray(self):
+        """Minimize to Windows taskbar notification area."""
+        self.fade_out_to_tray()
+
+        if self.tray:
+            try:
+                self.tray.notify(
+                    "Pro Screen Recorder đang chạy trong khay hệ thống.\nNhấn F9 để Bắt đầu/Dừng quay!",
+                    "Đã ẩn xuống khay hệ thống"
+                )
+            except Exception:
+                pass
+
+    def show_from_tray(self):
+        """Restore window from system tray with smooth fade-in."""
+        self.fade_in()
+
+    # --- UI Builders ---
 
     def _build_header(self):
         header = ctk.CTkFrame(self.main_scroll, fg_color="#111827", height=55, corner_radius=10)
@@ -85,13 +199,22 @@ class ProScreenRecorderApp(ctk.CTk):
             font=("Segoe UI", 11), text_color="#38bdf8"
         ).pack(side="left", padx=(10, 0))
 
+        # Right buttons: Minimize to Tray & Library
+        btn_tray = ctk.CTkButton(
+            header, text="📥 Thu Khay", width=100, height=32,
+            fg_color="#0284c7", hover_color="#0369a1",
+            corner_radius=8, font=("Segoe UI", 12, "bold"),
+            command=self.hide_to_tray
+        )
+        btn_tray.pack(side="right", padx=(4, 14), pady=10)
+
         btn_lib = ctk.CTkButton(
-            header, text="📹 Thư Viện", width=105, height=32,
+            header, text="📹 Thư Viện", width=95, height=32,
             fg_color="#1e293b", hover_color="#334155",
             corner_radius=8, font=("Segoe UI", 12, "bold"),
             command=self.open_library
         )
-        btn_lib.pack(side="right", padx=14, pady=10)
+        btn_lib.pack(side="right", padx=(4, 4), pady=10)
 
     def _build_record_card(self):
         self.record_card = ctk.CTkFrame(self.main_scroll, fg_color="#161e2e", corner_radius=14, border_width=1, border_color="#1f2937")
@@ -122,7 +245,7 @@ class ProScreenRecorderApp(ctk.CTk):
 
         btn_folder_text = "📁 Mở Desktop" if Path(self.settings.output_dir).resolve() == (Path.home() / "Desktop").resolve() else "📁 Thư mục lưu"
         self.btn_open_rec_folder = ctk.CTkButton(
-            sub_row, text=btn_folder_text, height=34, width=120,
+            sub_row, text=btn_folder_text, height=34, width=125,
             fg_color="#374151", hover_color="#4b5563",
             corner_radius=8, font=("Segoe UI", 13),
             command=self._open_output_dir
@@ -160,7 +283,6 @@ class ProScreenRecorderApp(ctk.CTk):
             self.main_scroll, fg_color="#064e3b",
             corner_radius=12, border_width=1, border_color="#059669"
         )
-        # Not packed initially
 
         inner = ctk.CTkFrame(self.toast_card, fg_color="transparent")
         inner.pack(fill="x", padx=14, pady=10)
@@ -389,7 +511,7 @@ class ProScreenRecorderApp(ctk.CTk):
         self.chk_cursor.pack(side="left", padx=(0, 14))
 
         self.chk_halo = ctk.CTkCheckBox(
-            row4, text="Vòng sáng nổi bật chuột (Halo)",
+            row4, text="Vòng sáng vàng (Halo)",
             command=self._on_halo_toggled
         )
         if getattr(self.settings, "mouse_halo", True):
@@ -399,7 +521,7 @@ class ProScreenRecorderApp(ctk.CTk):
         self.chk_halo.pack(side="left", padx=(0, 14))
 
         self.chk_ripple = ctk.CTkCheckBox(
-            row4, text="Hiệu ứng nhấp chuột (Click)",
+            row4, text="Hiệu ứng click chuột",
             command=self._on_ripple_toggled
         )
         if getattr(self.settings, "mouse_click_ripple", True):
@@ -408,24 +530,44 @@ class ProScreenRecorderApp(ctk.CTk):
             self.chk_ripple.deselect()
         self.chk_ripple.pack(side="left")
 
-        # Row 5: Floating Bar Option
+        # Row 5: Pro Integration Toggles (Floating bar, Sound cues, Close to tray)
         row5 = ctk.CTkFrame(card, fg_color="transparent")
         row5.pack(fill="x", padx=16, pady=(4, 6))
 
         self.chk_float = ctk.CTkCheckBox(
-            row5, text="Thanh điều khiển nổi (Tàng hình trong video)",
+            row5, text="Thanh nổi (Tàng hình)",
             command=self._on_float_toggled
         )
         if self.settings.show_floating_bar:
             self.chk_float.select()
         else:
             self.chk_float.deselect()
-        self.chk_float.pack(side="left")
+        self.chk_float.pack(side="left", padx=(0, 14))
+
+        self.chk_sound = ctk.CTkCheckBox(
+            row5, text="Âm thanh hiệu ứng",
+            command=self._on_sound_toggled
+        )
+        if getattr(self.settings, "sound_cues", True):
+            self.chk_sound.select()
+        else:
+            self.chk_sound.deselect()
+        self.chk_sound.pack(side="left", padx=(0, 14))
+
+        self.chk_close_tray = ctk.CTkCheckBox(
+            row5, text="Đóng [X] thu xuống khay",
+            command=self._on_close_tray_toggled
+        )
+        if getattr(self.settings, "close_to_tray", True):
+            self.chk_close_tray.select()
+        else:
+            self.chk_close_tray.deselect()
+        self.chk_close_tray.pack(side="left")
 
         # Hint note
         hint_lbl = ctk.CTkLabel(
             card,
-            text="✨ Thanh nổi hiện trên màn hình để điều khiển nhưng hoàn toàn tàng hình trong video clip.\n    (Bỏ chọn nếu muốn ẩn hoàn toàn không hiện gì, chỉ dùng phím F9/F10).",
+            text="✨ Thanh nổi hiện trên màn hình để bạn thao tác nhưng hoàn toàn tàng hình 100% trong video clip.",
             font=("Segoe UI", 11), text_color="#0284c7", justify="left"
         )
         hint_lbl.pack(anchor="w", padx=18, pady=(0, 12))
@@ -441,10 +583,10 @@ class ProScreenRecorderApp(ctk.CTk):
         ).pack(side="left")
 
         btn_quit = ctk.CTkButton(
-            footer, text="Thoát", width=70, height=28,
+            footer, text="Thoát hoàn toàn", width=120, height=28,
             fg_color="#334155", hover_color="#475569",
             corner_radius=6, font=("Segoe UI", 11),
-            command=self.on_close
+            command=self.quit_app
         )
         btn_quit.pack(side="right")
 
@@ -532,6 +674,14 @@ class ProScreenRecorderApp(ctk.CTk):
         self.settings.show_floating_bar = bool(self.chk_float.get())
         self.settings.save()
 
+    def _on_sound_toggled(self):
+        self.settings.sound_cues = bool(self.chk_sound.get())
+        self.settings.save()
+
+    def _on_close_tray_toggled(self):
+        self.settings.close_to_tray = bool(self.chk_close_tray.get())
+        self.settings.save()
+
     def _open_output_dir(self):
         try:
             os.startfile(self.settings.output_dir)
@@ -545,7 +695,20 @@ class ProScreenRecorderApp(ctk.CTk):
             return
         self.library_win = LibraryWindow(self, self.settings.output_dir)
 
-    # --- Recording Control ---
+    # --- Recording Control & Pulsing Glow Animation ---
+
+    def _pulse_record_button(self):
+        if not self.winfo_exists():
+            return
+        if self.engine.state == "recording":
+            self._pulse_glow = not self._pulse_glow
+            col = "#dc2626" if self._pulse_glow else "#991b1b"
+            self.btn_record.configure(fg_color=col)
+            self.lbl_status.configure(text_color="#ef4444" if self._pulse_glow else "#f87171")
+            self.after(500, self._pulse_record_button)
+        elif self.engine.state == "paused":
+            self.btn_record.configure(fg_color="#b45309")
+            self.lbl_status.configure(text_color="#eab308")
 
     def toggle_recording(self):
         if self.engine.state == "idle":
@@ -568,25 +731,29 @@ class ProScreenRecorderApp(ctk.CTk):
             self._actual_start_recording()
 
     def _on_countdown_cancelled(self):
-        self.deiconify()
-        self.lift()
-        self.focus_force()
+        self.fade_in()
 
     def _actual_start_recording(self):
         try:
             success = self.engine.start()
             if not success:
-                self.deiconify()
+                self.fade_in()
                 return
         except Exception as e:
-            self.deiconify()
+            self.fade_in()
             messagebox.showerror("Lỗi Ghi Hình", str(e), parent=self)
             return
 
+        if getattr(self.settings, "sound_cues", True):
+            play_sound_cue("start")
+
         # UI state
-        self.btn_record.configure(text="⏹  DỪNG GHI HÌNH (F9)", fg_color="#ef4444", hover_color="#dc2626")
+        self.btn_record.configure(text="⏹  DỪNG GHI HÌNH (F9)", fg_color="#dc2626", hover_color="#b91c1c")
         self.btn_pause.configure(state="normal", text="⏸ Tạm Dừng (F10)")
         self.lbl_status.configure(text="● ĐANG QUAY", text_color="#ef4444")
+
+        # Start breathing pulse glow
+        self._pulse_record_button()
 
         # Show floating bar if enabled
         if self.settings.show_floating_bar:
@@ -613,6 +780,8 @@ class ProScreenRecorderApp(ctk.CTk):
 
     def pause_recording(self):
         if self.engine.pause():
+            if getattr(self.settings, "sound_cues", True):
+                play_sound_cue("pause")
             self.btn_pause.configure(text="▶ Tiếp Tục (F10)", fg_color="#0284c7", hover_color="#0369a1")
             self.lbl_status.configure(text="❚❚ TẠM DỪNG", text_color="#eab308")
             if self.floating_bar and self.floating_bar.winfo_exists():
@@ -621,14 +790,20 @@ class ProScreenRecorderApp(ctk.CTk):
 
     def resume_recording(self):
         if self.engine.resume():
+            if getattr(self.settings, "sound_cues", True):
+                play_sound_cue("resume")
             self.btn_pause.configure(text="⏸ Tạm Dừng (F10)", fg_color="#374151", hover_color="#4b5563")
             self.lbl_status.configure(text="● ĐANG QUAY", text_color="#ef4444")
+            self._pulse_record_button()
             if self.floating_bar and self.floating_bar.winfo_exists():
                 self.floating_bar.is_paused = False
                 self.floating_bar.btn_pause.configure(text="⏸", fg_color="#334155")
 
     def stop_recording(self):
         self.engine.set_excluded_rect_provider(None)
+        if getattr(self.settings, "sound_cues", True):
+            play_sound_cue("stop")
+
         self.lbl_status.configure(text="⏳ ĐANG XỬ LÝ & LƯU...", text_color="#38bdf8")
         self.btn_record.configure(state="disabled", text="⏳ Đang đóng gói file...")
         self.btn_pause.configure(state="disabled")
@@ -644,9 +819,7 @@ class ProScreenRecorderApp(ctk.CTk):
         threading.Thread(target=_do_stop, daemon=True).start()
 
     def _on_stop_complete(self, final_file):
-        self.deiconify()
-        self.lift()
-        self.focus_force()
+        self.fade_in()
 
         self.btn_record.configure(state="normal", text="🔴  BẮT ĐẦU GHI HÌNH (F9)", fg_color="#dc2626", hover_color="#b91c1c")
         self.btn_pause.configure(state="disabled", text="⏸ Tạm Dừng (F10)", fg_color="#374151")
@@ -669,9 +842,7 @@ class ProScreenRecorderApp(ctk.CTk):
                 self.library_win.refresh_list()
 
     def _restore_from_floating(self):
-        self.deiconify()
-        self.lift()
-        self.focus_force()
+        self.fade_in()
 
     def _on_engine_update(self, stats):
         def _apply():
@@ -709,7 +880,7 @@ class ProScreenRecorderApp(ctk.CTk):
     def _on_hotkey_toggle_pause(self):
         self.after(0, self.toggle_pause)
 
-    # --- Teardown ---
+    # --- Teardown & Exit ---
 
     def on_close(self):
         if self.engine.state in ("recording", "paused"):
@@ -722,12 +893,25 @@ class ProScreenRecorderApp(ctk.CTk):
                 self.stop_recording()
                 return
 
-        # Close all windows and hooks
+        # If close to tray is enabled, minimize smoothly to tray
+        if getattr(self.settings, "close_to_tray", True):
+            self.hide_to_tray()
+        else:
+            self.quit_app()
+
+    def quit_app(self):
+        """Clean teardown and full exit."""
         self.hotkeys.stop()
         if self.floating_bar and self.floating_bar.winfo_exists():
             self.floating_bar.destroy()
         if self.library_win and self.library_win.winfo_exists():
             self.library_win.destroy()
+        if self.tray:
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
+            self.tray = None
         self.engine.audio_mgr.close()
         self.destroy()
 
@@ -738,7 +922,7 @@ def main():
     if instance.already_running:
         root = tk.Tk()
         root.withdraw()
-        messagebox.showinfo("Thông báo", "Pro Screen Recorder đang chạy trên máy tính.")
+        messagebox.showinfo("Thông báo", "Pro Screen Recorder đang chạy trên máy tính (hãy kiểm tra khay hệ thống cạnh đồng hồ).")
         root.destroy()
         sys.exit(0)
 

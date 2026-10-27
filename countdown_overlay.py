@@ -47,12 +47,26 @@ class CountdownOverlay:
             font=("Segoe UI", 13)
         )
 
+        def _play_beep(pitch):
+            def _b():
+                try:
+                    import winsound
+                    winsound.Beep(pitch, 60)
+                except Exception:
+                    pass
+            import threading
+            threading.Thread(target=_b, daemon=True).start()
+
+        _play_beep(880)
+
         def _tick():
             self.count -= 1
             if self.count > 0:
+                _play_beep(880)
                 canvas.itemconfig(self.text_id, text=str(self.count))
                 self.root.after(1000, _tick)
             else:
+                _play_beep(1318)
                 canvas.itemconfig(self.text_id, text="GO!", fill="#10b981")
                 self.root.after(350, self._done)
 

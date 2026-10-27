@@ -36,16 +36,58 @@ class SingleInstance:
             self.mutex = None
 
 
-def create_tray(icon_path: Path, on_open, on_quit):
-    """Creates a system tray icon with Open and Exit options."""
+def set_dark_titlebar(window):
+    """Enable Windows 10/11 native dark mode for title bar."""
+    try:
+        window.update_idletasks()
+        hwnd_client = window.winfo_id()
+        top_hwnd = ctypes.windll.user32.GetAncestor(hwnd_client, 2) or hwnd_client
+        val = ctypes.c_int(1)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(top_hwnd, 20, ctypes.byref(val), ctypes.sizeof(val))
+    except Exception:
+        pass
+
+
+def play_sound_cue(cue_type="start"):
+    """Play subtle professional audio cues for recording events."""
+    import threading
+    def _run():
+        try:
+            import winsound
+            if cue_type == "start":
+                winsound.Beep(988, 70)
+                winsound.Beep(1318, 110)
+            elif cue_type == "stop":
+                winsound.Beep(1175, 70)
+                winsound.Beep(659, 120)
+            elif cue_type == "pause":
+                winsound.Beep(880, 80)
+            elif cue_type == "resume":
+                winsound.Beep(1046, 80)
+            elif cue_type == "tray":
+                winsound.Beep(1046, 50)
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def create_tray(icon_path: Path, on_open, on_toggle_record, on_toggle_pause, on_open_library, on_open_desktop, on_quit):
+    """Creates a system tray icon with rich menu options."""
     try:
         img = Image.open(icon_path)
     except Exception:
         img = Image.new("RGBA", (32, 32), (239, 68, 68, 255))
 
     menu = pystray.Menu(
-        pystray.MenuItem("Mở giao diện", on_open, default=True),
-        pystray.MenuItem("Thoát hoàn toàn", on_quit)
+        pystray.MenuItem("🎥 Mở giao diện", on_open, default=True),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("🔴 Bắt đầu / Dừng quay (F9)", on_toggle_record),
+        pystray.MenuItem("⏸ Tạm dừng / Tiếp tục (F10)", on_toggle_pause),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("📹 Thư viện video", on_open_library),
+        pystray.MenuItem("📁 Mở Desktop", on_open_desktop),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("❌ Thoát hoàn toàn", on_quit)
     )
 
     tray = pystray.Icon("ProScreenRecorder", img, "Pro Screen Recorder", menu)
