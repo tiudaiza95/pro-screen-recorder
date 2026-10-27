@@ -17,6 +17,7 @@ from floating_bar import FloatingBar
 from library_window import LibraryWindow
 from hotkey_manager import HotkeyManager
 from countdown_overlay import CountdownOverlay
+from notification_pill import NotificationPill
 from desktop_support import (
     SingleInstance, set_high_dpi_aware, exclude_from_capture,
     set_dark_titlebar, play_sound_cue, create_tray
@@ -54,6 +55,8 @@ class ProScreenRecorderApp(ctk.CTk):
         self.library_win = None
         self.last_saved_file = None
         self.tray = None
+        self.pill = None
+        self._main_was_visible = False
 
         # Pulsing recording glow animation state
         self._pulse_glow = False
@@ -804,13 +807,24 @@ class ProScreenRecorderApp(ctk.CTk):
         if getattr(self.settings, "sound_cues", True):
             play_sound_cue("stop")
 
+        # Check if the main window was visibly open on screen
+        try:
+            self._main_was_visible = (self.state() != "iconic" and self.winfo_viewable() and float(self.attributes("-alpha") or 1.0) > 0.1)
+        except Exception:
+            self._main_was_visible = False
+
         self.lbl_status.configure(text="⏳ ĐANG XỬ LÝ & LƯU...", text_color="#38bdf8")
         self.btn_record.configure(state="disabled", text="⏳ Đang đóng gói file...")
         self.btn_pause.configure(state="disabled")
 
-        if self.floating_bar and self.floating_bar.winfo_exists():
-            self.floating_bar.destroy()
-            self.floating_bar = None
+        # If main window is NOT visible and floating bar is not active, show mini notification pill
+        if not self._main_was_visible and not (self.floating_bar and self.floating_bar.winfo_exists()):
+            try:
+                if self.pill and self.pill.winfo_exists():
+                    self.pill.destroy()
+                self.pill = NotificationPill(self, text="⏳ Đang lưu bản ghi video...", is_loading=True)
+            except Exception:
+                pass
 
         def _do_stop():
             final_file = self.engine.stop()
@@ -819,8 +833,7 @@ class ProScreenRecorderApp(ctk.CTk):
         threading.Thread(target=_do_stop, daemon=True).start()
 
     def _on_stop_complete(self, final_file):
-        self.fade_in()
-
+        # Update main window controls quietly in background
         self.btn_record.configure(state="normal", text="🔴  BẮT ĐẦU GHI HÌNH (F9)", fg_color="#dc2626", hover_color="#b91c1c")
         self.btn_pause.configure(state="disabled", text="⏸ Tạm Dừng (F10)", fg_color="#374151")
         self.lbl_status.configure(text="● SẴN SÀNG", text_color="#10b981")
@@ -830,16 +843,56 @@ class ProScreenRecorderApp(ctk.CTk):
         # Reset VU meter
         self.mic_vu_canvas.coords(self.mic_vu_bar, 0, 0, 0, 12)
 
+        file_name = Path(final_file).name if final_file else ""
+        size_mb = 0.0
         if final_file and Path(final_file).is_file():
             self.last_saved_file = Path(final_file)
             size_mb = self.last_saved_file.stat().st_size / (1024 * 1024)
-            self.lbl_toast_subtitle.configure(text=f"📁 {self.last_saved_file.name}   •   {size_mb:.1f} MB")
-            # Show instant toast banner right below record card
-            self.toast_card.pack(fill="x", padx=16, pady=4, after=self.record_card)
 
             # Refresh library if open
             if self.library_win and self.library_win.winfo_exists():
                 self.library_win.refresh_list()
+
+        # Handle Floating bar: show saved confirmation and close
+        if self.floating_bar and self.floating_bar.winfo_exists():
+            try:
+                self.floating_bar.show_saved_and_close()
+            except Exception:
+                pass
+            self.floating_bar = None
+
+        # User-centric behavior:
+        # If the main window was already open, show in-app toast card.
+        # IF IT WAS MINIMIZED / IN TRAY: NEVER POP UP THE MAIN WINDOW!
+        if self._main_was_visible:
+            if final_file and Path(final_file).is_file():
+                self.lbl_toast_subtitle.configure(text=f"📁 {file_name}   •   {size_mb:.1f} MB")
+                self.toast_card.pack(fill="x", padx=16, pady=4, after=self.record_card)
+        else:
+            # Show sleek Notification Pill at top of screen for 3.5s
+            if final_file and Path(final_file).is_file():
+                if self.pill and self.pill.winfo_exists():
+                    self.pill.set_success(f"✅ Đã lưu: {file_name} ({size_mb:.1f} MB)", file_path=final_file)
+                else:
+                    try:
+                        self.pill = NotificationPill(
+                            self,
+                            text=f"✅ Đã lưu ra Desktop: {file_name} ({size_mb:.1f} MB)",
+                            is_loading=False,
+                            file_path=final_file
+                        )
+                    except Exception:
+                        pass
+
+                # Windows System Tray Notification
+                if self.tray:
+                    try:
+                        self.tray.notify(
+                            f"File: {file_name} ({size_mb:.1f} MB)\nĐã lưu thẳng ra Desktop của bạn!",
+                            "✅ Đã lưu bản ghi màn hình"
+                        )
+                    except Exception:
+                        pass
 
     def _restore_from_floating(self):
         self.fade_in()

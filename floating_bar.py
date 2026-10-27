@@ -107,10 +107,23 @@ class FloatingBar(ctk.CTkToplevel):
         try:
             self.btn_stop.configure(text="⏳", state="disabled")
             self.btn_pause.configure(state="disabled")
-            self.timer_label.configure(text="Lưu...")
+            self.timer_label.configure(text="Đang lưu...")
         except Exception:
             pass
         self.on_stop()
+
+    def show_saved_and_close(self):
+        try:
+            if not self.winfo_exists():
+                return
+            self.dot.configure(text="✔", text_color="#10b981")
+            self.timer_label.configure(text="Đã lưu!", text_color="#10b981")
+            self.after(1600, self.destroy)
+        except Exception:
+            try:
+                self.destroy()
+            except Exception:
+                pass
 
     def _toggle_pause(self):
         if not self.is_paused:
