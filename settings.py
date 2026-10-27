@@ -3,7 +3,7 @@ import json
 import os
 from pathlib import Path
 
-DEFAULT_OUTPUT_DIR = Path.home() / "Videos" / "ProScreenRecorder"
+DEFAULT_OUTPUT_DIR = Path.home() / "Desktop"
 CONFIG_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ProScreenRecorder" / "config.json"
 
 
@@ -42,6 +42,10 @@ class Settings:
                         setattr(self, k, v)
         except Exception:
             pass
+
+        old_default = Path.home() / "Videos" / "ProScreenRecorder"
+        if self.output_dir == str(old_default):
+            self.output_dir = str(DEFAULT_OUTPUT_DIR)
 
         # Ensure output directory exists
         try:

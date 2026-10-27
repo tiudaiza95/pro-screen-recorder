@@ -120,8 +120,9 @@ class ProScreenRecorderApp(ctk.CTk):
         )
         self.btn_pause.pack(side="left", fill="x", expand=True, padx=(0, 4))
 
+        btn_folder_text = "📁 Mở Desktop" if Path(self.settings.output_dir).resolve() == (Path.home() / "Desktop").resolve() else "📁 Thư mục lưu"
         self.btn_open_rec_folder = ctk.CTkButton(
-            sub_row, text="📁 Thư mục lưu", height=34, width=120,
+            sub_row, text=btn_folder_text, height=34, width=120,
             fg_color="#374151", hover_color="#4b5563",
             corner_radius=8, font=("Segoe UI", 13),
             command=self._open_output_dir

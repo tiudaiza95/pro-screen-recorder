@@ -57,11 +57,18 @@ class LibraryWindow(ctk.CTkToplevel):
             lbl.pack(pady=40)
             return
 
-        videos = sorted(
-            [p for p in self.output_dir.glob("*.mp4") if not p.name.startswith("~")],
-            key=lambda x: x.stat().st_mtime,
-            reverse=True
-        )
+        if self.output_dir.resolve() == (Path.home() / "Desktop").resolve():
+            videos = sorted(
+                [p for p in self.output_dir.glob("REC_*.mp4")],
+                key=lambda x: x.stat().st_mtime,
+                reverse=True
+            )
+        else:
+            videos = sorted(
+                [p for p in self.output_dir.glob("*.mp4") if not p.name.startswith("~")],
+                key=lambda x: x.stat().st_mtime,
+                reverse=True
+            )
 
         if not videos:
             lbl = ctk.CTkLabel(
