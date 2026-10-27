@@ -5,6 +5,7 @@ import threading
 import time
 import wave
 from pathlib import Path
+import numpy as np
 import pyaudiowpatch as pyaudio
 
 
@@ -87,6 +88,10 @@ class AudioManager:
         self._thread.start()
 
     def _record_loop(self):
+        chunk_count = 0
+        vol = getattr(self, "volume", 1.0)
+        has_custom_vol = vol != 1.0
+
         while not self._stop_event.is_set():
             if self.paused:
                 self.current_rms = 0.0
@@ -94,30 +99,38 @@ class AudioManager:
                 continue
             try:
                 data = self.stream.read(1024, exception_on_overflow=False)
-                if getattr(self, "volume", 1.0) != 1.0:
+                if has_custom_vol:
                     try:
-                        import numpy as np
                         arr = np.frombuffer(data, dtype=np.int16)
-                        data = np.clip(arr * self.volume, -32768, 32767).astype(np.int16).tobytes()
+                        data = np.clip(arr * vol, -32768, 32767).astype(np.int16).tobytes()
                     except Exception:
                         pass
                 self.frames.append(data)
-                self._calculate_rms(data)
+
+                # Vectorized RMS calculated once every 4 chunks (~10 Hz) to eliminate CPU overhead
+                chunk_count += 1
+                if chunk_count % 4 == 0:
+                    self._calculate_rms_fast(data)
             except Exception:
                 break
         self.current_rms = 0.0
 
     def _calculate_rms(self, data):
+        """Public/test-compatible RMS calculation."""
+        self._calculate_rms_fast(data)
+
+    def _calculate_rms_fast(self, data):
         try:
-            count = len(data) // 2
-            if count == 0:
+            if not data:
                 self.current_rms = 0.0
                 return
-            shorts = struct.unpack(f"{count}h", data)
-            sum_squares = sum(s * s for s in shorts)
-            rms = math.sqrt(sum_squares / count)
-            # Map 0 - 32768 to 0.0 - 1.0 with a logarithmic perception curve
-            if rms > 10:
+            arr = np.frombuffer(data, dtype=np.int16)
+            if len(arr) == 0:
+                self.current_rms = 0.0
+                return
+            mean_sq = float(np.mean(arr.astype(np.float32) ** 2))
+            rms = math.sqrt(mean_sq)
+            if rms > 10.0:
                 norm = min(1.0, math.log10(rms) / 4.2)
                 self.current_rms = max(0.0, norm)
             else:

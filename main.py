@@ -57,6 +57,9 @@ class ProScreenRecorderApp(ctk.CTk):
         self.tray = None
         self.pill = None
         self._main_was_visible = False
+        # UI update coalescing guard & state cache
+        self._ui_update_pending = False
+        self._latest_stats = None
 
         # Pulsing recording glow animation state
         self._pulse_glow = False
@@ -898,32 +901,41 @@ class ProScreenRecorderApp(ctk.CTk):
         self.fade_in()
 
     def _on_engine_update(self, stats):
-        def _apply():
-            if not self.winfo_exists():
-                return
-            elapsed = stats.get("elapsed", 0.0)
+        self._latest_stats = stats
+        if not self._ui_update_pending:
+            self._ui_update_pending = True
+            self.after(0, self._apply_ui_update)
+
+    def _apply_ui_update(self):
+        self._ui_update_pending = False
+        if not self.winfo_exists() or not self._latest_stats:
+            return
+
+        stats = self._latest_stats
+        elapsed = stats.get("elapsed", 0.0)
+        fps = stats.get("fps", 0.0)
+        size_mb = stats.get("size_bytes", 0) / (1024 * 1024)
+        mic_rms = stats.get("mic_rms", 0.0)
+
+        # Update floating bar if visible (even if main window is hidden)
+        if self.floating_bar and self.floating_bar.winfo_exists():
+            self.floating_bar.update_stats(elapsed, mic_rms)
+
+        # Only touch main window widgets if the main window is actually visible!
+        # Skipping canvas coords/redraws when minimized eliminates UI thread overhead completely.
+        if self.state() != "iconic" and self.winfo_viewable() and float(self.attributes("-alpha") or 1.0) > 0.05:
             m, s = divmod(int(elapsed), 60)
             h, m = divmod(m, 60)
             self.lbl_timer.configure(text=f"{h:02d}:{m:02d}:{s:02d}")
-
-            fps = stats.get("fps", 0.0)
-            size_mb = stats.get("size_bytes", 0) / (1024 * 1024)
             self.lbl_details.configure(text=f"{fps:.1f} FPS  •  {size_mb:.1f} MB")
 
             # Mic VU meter
-            mic_rms = stats.get("mic_rms", 0.0)
             canvas_w = self.mic_vu_canvas.winfo_width()
             if canvas_w > 10:
                 bar_w = int(max(0.0, min(1.0, mic_rms)) * canvas_w)
                 color = "#10b981" if mic_rms < 0.8 else "#ef4444"
                 self.mic_vu_canvas.coords(self.mic_vu_bar, 0, 0, bar_w, 12)
                 self.mic_vu_canvas.itemconfig(self.mic_vu_bar, fill=color)
-
-            # Update floating bar if exists
-            if self.floating_bar and self.floating_bar.winfo_exists():
-                self.floating_bar.update_stats(elapsed, mic_rms)
-
-        self.after(0, _apply)
 
     # --- Hotkeys Handlers ---
 

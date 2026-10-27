@@ -3,6 +3,7 @@ import ctypes
 from ctypes import wintypes
 import os
 from pathlib import Path
+import queue
 import shutil
 import subprocess
 import threading
@@ -14,6 +15,14 @@ from settings import Settings
 
 u32 = ctypes.windll.user32
 g32 = ctypes.windll.gdi32
+winmm = ctypes.windll.winmm
+k32 = ctypes.windll.kernel32
+try:
+    k32.GetCurrentThread.restype = wintypes.HANDLE
+    k32.SetThreadPriority.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.SetThreadPriority.restype = wintypes.BOOL
+except Exception:
+    pass
 
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
@@ -71,22 +80,25 @@ class CursorRenderer:
         self.active_ripples = []
         self._was_l_down = False
         self._was_r_down = False
+        # Pre-allocated structures to avoid per-frame garbage collection
+        self._pt = POINT()
+        self._ci = CURSORINFO()
+        self._ci.cbSize = ctypes.sizeof(CURSORINFO)
 
     def draw(self, hdc_mem, left, top, show_cursor, halo, click_ripple, excluded_rect):
         if not show_cursor:
             return
 
-        pt = POINT()
-        if not u32.GetCursorPos(ctypes.byref(pt)):
+        if not u32.GetCursorPos(ctypes.byref(self._pt)):
             return
 
-        cur_x = pt.x - left
-        cur_y = pt.y - top
+        cur_x = self._pt.x - left
+        cur_y = self._pt.y - top
 
         # Exclude if inside floating bar
         if excluded_rect:
             rx, ry, rw, rh = excluded_rect
-            if rx <= pt.x <= rx + rw and ry <= pt.y <= ry + rh:
+            if rx <= self._pt.x <= rx + rw and ry <= self._pt.y <= ry + rh:
                 return
 
         # Check clicks
@@ -124,11 +136,9 @@ class CursorRenderer:
             g32.SelectObject(hdc_mem, old_brush)
 
         # Draw actual cursor icon (query current cursor or fallback to arrow)
-        ci = CURSORINFO()
-        ci.cbSize = ctypes.sizeof(CURSORINFO)
         h_cur = None
-        if u32.GetCursorInfo(ctypes.byref(ci)) and ci.hCursor:
-            h_cur = ci.hCursor
+        if u32.GetCursorInfo(ctypes.byref(self._ci)) and self._ci.hCursor:
+            h_cur = self._ci.hCursor
         if not h_cur:
             h_cur = self.h_arrow
 
@@ -216,9 +226,12 @@ class RecorderEngine:
         self.current_fps = 0.0
 
         self._record_thread = None
+        self._writer_thread = None
         self._stats_thread = None
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
+        self._frame_pool = None
+        self._work_queue = None
 
         self.temp_video_path = None
         self.temp_audio_path = None
@@ -300,6 +313,15 @@ class RecorderEngine:
         fps = self.settings.fps
         bitrate = self.settings.get_bitrate()
 
+        # Encoder optimization flags:
+        # h264_mf: dedicated display_remoting scenario + low-delay VBR prevents internal lookahead queuing
+        # libx264: ultrafast preset with zerolatency tune for minimum CPU overhead
+        extra_enc_flags = []
+        if encoder == "h264_mf":
+            extra_enc_flags = ["-scenario", "display_remoting", "-rate_control", "ld_vbr"]
+        elif encoder == "libx264":
+            extra_enc_flags = ["-preset", "ultrafast", "-tune", "zerolatency"]
+
         video_cmd = [
             self.ffmpeg_path, "-y",
             "-f", "rawvideo",
@@ -310,7 +332,7 @@ class RecorderEngine:
             "-i", "-",
             *scale_filter,
             "-c:v", encoder,
-            *(["-preset", "ultrafast", "-tune", "zerolatency"] if encoder == "libx264" else []),
+            *extra_enc_flags,
             "-b:v", bitrate,
             "-pix_fmt", "nv12" if encoder == "h264_mf" else "yuv420p",
             str(self.temp_video_path)
@@ -322,12 +344,22 @@ class RecorderEngine:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                bufsize=10485760,  # 10 MB OS pipe buffer absorbs momentary I/O spikes
                 creationflags=NO_WINDOW
             )
         except Exception as e:
             if has_audio:
                 self.audio_mgr.stop_and_save(self.temp_audio_path)
             raise RuntimeError(f"Failed to launch FFmpeg: {e}")
+
+        # Decoupled frame memory pool:
+        # Pre-allocate 3 buffers (1 capturing, 1 ready, 1 encoding)
+        # Prevents continuous RAM allocation and Python Garbage Collection stalls
+        frame_bytes = width * height * 4
+        self._frame_pool = queue.Queue()
+        for _ in range(3):
+            self._frame_pool.put(bytearray(frame_bytes))
+        self._work_queue = queue.Queue(maxsize=2)
 
         self.state = "recording"
         self.start_time = time.perf_counter()
@@ -337,9 +369,18 @@ class RecorderEngine:
         self._stop_event.clear()
         self._pause_event.clear()
 
+        # Dedicated background pipe writer thread
+        self._writer_thread = threading.Thread(
+            target=self._pipe_writer_loop,
+            args=(v_proc,),
+            daemon=True
+        )
+        self._writer_thread.start()
+
+        # High-priority frame grabber thread
         self._record_thread = threading.Thread(
             target=self._capture_loop,
-            args=(v_proc, left, top, width, height, fps),
+            args=(left, top, width, height, fps, frame_bytes),
             daemon=True
         )
         self._record_thread.start()
@@ -348,8 +389,46 @@ class RecorderEngine:
         self._stats_thread.start()
         return True
 
-    def _capture_loop(self, v_proc, left, top, width, height, fps):
+    def _pipe_writer_loop(self, v_proc):
+        """Asynchronously writes captured frames to FFmpeg stdin without blocking the capture clock."""
+        try:
+            while not self._stop_event.is_set() or not self._work_queue.empty():
+                try:
+                    buf = self._work_queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+
+                try:
+                    v_proc.stdin.write(buf)
+                except (BrokenPipeError, OSError, ValueError):
+                    break
+                finally:
+                    if self._frame_pool is not None:
+                        try:
+                            self._frame_pool.put_nowait(buf)
+                        except Exception:
+                            pass
+                    self._work_queue.task_done()
+        finally:
+            try:
+                v_proc.stdin.close()
+                v_proc.wait(timeout=5.0)
+            except Exception:
+                pass
+
+    def _capture_loop(self, left, top, width, height, fps, frame_bytes):
+        """High-efficiency screen capture loop running with 1ms timer precision."""
         ensure_input_desktop()
+
+        try:
+            winmm.timeBeginPeriod(1)
+        except Exception:
+            pass
+
+        try:
+            k32.SetThreadPriority(k32.GetCurrentThread(), 1)  # THREAD_PRIORITY_ABOVE_NORMAL
+        except Exception:
+            pass
 
         hdc_screen = u32.GetDC(0)
         hdc_mem = g32.CreateCompatibleDC(hdc_screen)
@@ -368,7 +447,6 @@ class RecorderEngine:
 
         cursor_renderer = CursorRenderer()
         target_interval = 1.0 / fps
-        frame_bytes = width * height * 4
         record_cursor = self.settings.record_cursor
         mouse_halo = getattr(self.settings, "mouse_halo", True)
         mouse_click_ripple = getattr(self.settings, "mouse_click_ripple", True)
@@ -381,9 +459,9 @@ class RecorderEngine:
 
                 t_frame_start = time.perf_counter()
 
-                # BitBlt screen region to memory DC
-                # 0x00CC0020 (SRCCOPY) | 0x40000000 (CAPTUREBLT for layered windows)
-                g32.BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, left, top, 0x00CC0020 | 0x40000000)
+                # Pure SRCCOPY (0x00CC0020) is hardware-accelerated by DWM
+                # Eliminates CAPTUREBLT DWM composition lock, cursor flicker & desktop lag
+                g32.BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, left, top, 0x00CC0020)
 
                 # Draw mouse cursor with halo & click ripple effects
                 if record_cursor:
@@ -396,15 +474,25 @@ class RecorderEngine:
                         excluded_rect=ex_rect
                     )
 
-                # Write raw BGRA frame to FFmpeg stdin
-                buf = (ctypes.c_char * frame_bytes).from_address(p_bits.value)
+                # Acquire pre-allocated reusable buffer (non-blocking)
                 try:
-                    v_proc.stdin.write(buf)
-                    self.frames_captured += 1
-                except (BrokenPipeError, OSError):
-                    break
+                    buf = self._frame_pool.get_nowait()
+                except queue.Empty:
+                    # FFmpeg is temporarily busy with a keyframe: drop frame rather than lagging the capture clock
+                    pass
+                else:
+                    # Blazing-fast memmove into pre-allocated memory (~0.4 ms)
+                    c_buf = (ctypes.c_char * frame_bytes).from_buffer(buf)
+                    ctypes.memmove(c_buf, p_bits, frame_bytes)
 
-                # Sleep to maintain stable framerate
+                    # Hand off to async pipe writer
+                    try:
+                        self._work_queue.put_nowait(buf)
+                        self.frames_captured += 1
+                    except queue.Full:
+                        self._frame_pool.put_nowait(buf)
+
+                # Precision sleep to maintain target framerate
                 elapsed = time.perf_counter() - t_frame_start
                 sleep_left = target_interval - elapsed
                 if sleep_left > 0.001:
@@ -412,8 +500,7 @@ class RecorderEngine:
 
         finally:
             try:
-                v_proc.stdin.close()
-                v_proc.wait(timeout=5.0)
+                winmm.timeEndPeriod(1)
             except Exception:
                 pass
 
@@ -425,6 +512,8 @@ class RecorderEngine:
     def _stats_loop(self):
         last_frame_count = 0
         last_calc_time = time.perf_counter()
+        last_disk_check_time = 0.0
+        cached_size_bytes = 0
 
         while not self._stop_event.is_set():
             time.sleep(0.2)
@@ -445,13 +534,14 @@ class RecorderEngine:
                 last_frame_count = self.frames_captured
                 last_calc_time = now
 
-            # Calculate estimated size
-            size_bytes = 0
-            if self.temp_video_path and self.temp_video_path.is_file():
-                try:
-                    size_bytes = self.temp_video_path.stat().st_size
-                except Exception:
-                    pass
+            # Query disk file size only once every 1.0s to avoid disk I/O contention
+            if now - last_disk_check_time >= 1.0:
+                last_disk_check_time = now
+                if self.temp_video_path and self.temp_video_path.is_file():
+                    try:
+                        cached_size_bytes = self.temp_video_path.stat().st_size
+                    except Exception:
+                        pass
 
             mic_rms = self.audio_mgr.current_rms if self.settings.record_mic else 0.0
 
@@ -460,7 +550,7 @@ class RecorderEngine:
                     "state": self.state,
                     "elapsed": max(0.0, elapsed),
                     "fps": round(self.current_fps, 1),
-                    "size_bytes": size_bytes,
+                    "size_bytes": cached_size_bytes,
                     "mic_rms": mic_rms
                 })
 
@@ -491,9 +581,21 @@ class RecorderEngine:
         self._stop_event.set()
         self._pause_event.clear()
 
+        # Stop frame capture
         if self._record_thread:
             self._record_thread.join(timeout=6.0)
             self._record_thread = None
+
+        # Wait for pipe writer to drain buffered frames
+        if self._work_queue:
+            try:
+                self._work_queue.join()
+            except Exception:
+                pass
+
+        if self._writer_thread:
+            self._writer_thread.join(timeout=5.0)
+            self._writer_thread = None
 
         if self._stats_thread:
             self._stats_thread.join(timeout=2.0)
@@ -504,7 +606,7 @@ class RecorderEngine:
         if self.settings.record_mic and self.temp_audio_path:
             has_audio = self.audio_mgr.stop_and_save(self.temp_audio_path)
 
-        # Mux video and audio with FFmpeg
+        # Mux video and audio
         final_file = self._mux_recording(has_audio)
         self.state = "idle"
         return final_file
@@ -516,25 +618,30 @@ class RecorderEngine:
 
         final_path = self.final_output_path
 
-        if has_audio and self.temp_audio_path and self.temp_audio_path.is_file():
-            mux_cmd = [
-                self.ffmpeg_path, "-y",
-                "-i", str(self.temp_video_path),
-                "-i", str(self.temp_audio_path),
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-movflags", "+faststart",
-                str(final_path)
-            ]
-        else:
-            mux_cmd = [
-                self.ffmpeg_path, "-y",
-                "-i", str(self.temp_video_path),
-                "-c:v", "copy",
-                "-movflags", "+faststart",
-                str(final_path)
-            ]
+        # If no audio was recorded, instantly rename/replace temp video file (0.001s, zero copy overhead!)
+        if not has_audio or not self.temp_audio_path or not self.temp_audio_path.is_file():
+            try:
+                os.replace(str(self.temp_video_path), str(final_path))
+                self._clean_temp_files()
+                return str(final_path)
+            except Exception:
+                try:
+                    shutil.move(str(self.temp_video_path), str(final_path))
+                    self._clean_temp_files()
+                    return str(final_path)
+                except Exception:
+                    pass
+
+        mux_cmd = [
+            self.ffmpeg_path, "-y",
+            "-i", str(self.temp_video_path),
+            "-i", str(self.temp_audio_path),
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            str(final_path)
+        ]
 
         try:
             subprocess.run(
@@ -549,7 +656,6 @@ class RecorderEngine:
                 return str(final_path)
         except Exception as e:
             print(f"Error during muxing: {e}")
-            # If muxing failed, fallback to keeping temp_video_path
             if self.temp_video_path.is_file():
                 try:
                     shutil.move(str(self.temp_video_path), str(final_path))

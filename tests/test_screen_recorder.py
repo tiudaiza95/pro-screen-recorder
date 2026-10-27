@@ -95,6 +95,32 @@ class TestRecorderEngine(unittest.TestCase):
         finally:
             engine.audio_mgr.close()
 
+    def test_live_recording_cycle(self):
+        import time
+        s = Settings()
+        s.record_mic = False
+        s.fps = 30
+        engine = RecorderEngine(s)
+        # Small region for fast unit test
+        engine.set_region((0, 0, 320, 240))
+        try:
+            ok = engine.start()
+            self.assertTrue(ok)
+            self.assertEqual(engine.state, "recording")
+            time.sleep(0.3)
+            self.assertTrue(engine.pause())
+            self.assertEqual(engine.state, "paused")
+            time.sleep(0.1)
+            self.assertTrue(engine.resume())
+            self.assertEqual(engine.state, "recording")
+            time.sleep(0.2)
+            out = engine.stop()
+            self.assertIsNotNone(out)
+            self.assertTrue(Path(out).is_file())
+            Path(out).unlink(missing_ok=True)
+        finally:
+            engine.audio_mgr.close()
+
 
 class TestSingleInstance(unittest.TestCase):
     def test_single_instance(self):
